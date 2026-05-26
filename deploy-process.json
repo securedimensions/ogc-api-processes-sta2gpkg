@@ -1,0 +1,83 @@
+{
+  "id": "sta-to-gpkg",
+  "title": "SensorThings to GeoPackage",
+  "description": "Exports Observations from an OGC SensorThings API v1.1 service to a GeoPackage (stdout). IPT: stderr OGC_PROCESSING_PROGRESS + OGC_PROCESSING_META, then describeProcessing STAC.",
+  "version": "2.0.0",
+  "iptCompliant": true,
+  "inputs": {
+    "url": {
+      "title": "Observations URL",
+      "description": "STA Observations collection URL (or nested Observations URL). Required.",
+      "schema": {
+        "type": "string",
+        "format": "uri",
+        "minLength": 1
+      }
+    },
+    "filter": {
+      "title": "OData $filter",
+      "description": "Optional OData filter applied to Observations (e.g. phenomenonTime ge 2024-01-01T00:00:00Z).",
+      "schema": {
+        "type": "string"
+      }
+    },
+    "top": {
+      "title": "Page size",
+      "description": "OData $top page size when paging Observations.",
+      "schema": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 1000
+      }
+    },
+    "max_observations": {
+      "title": "Maximum observations",
+      "description": "Fetch exactly this many observations when the server has enough (0 = no limit). Uses paged HTTP requests; prefer top=1000 for large values.",
+      "schema": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 0
+      }
+    },
+    "timeout": {
+      "title": "HTTP timeout (seconds)",
+      "description": "Timeout for STA HTTP requests.",
+      "schema": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 30
+      }
+    },
+    "verbose": {
+      "title": "Verbose logging",
+      "description": "Enable DEBUG logging on stderr.",
+      "schema": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "outputs": {
+    "result": {
+      "title": "GeoPackage export",
+      "description": "SensorThings export as GeoPackage (SQLite).",
+      "schema": {
+        "type": "object",
+        "contentMediaType": "application/geopackage+sqlite3"
+      }
+    }
+  },
+  "executionUnit": {
+    "type": "docker",
+    "image": "docker.io/securedimensions/sta_to_gpkg:1.0",
+    "imageHash": "sha256:35d05fe87ce53ccc224dd39d00eabbfc061f54e13f38b61f671eb0310dd9c3a3",
+    "network": "bridge"
+  },
+  "additionalProperties": {
+    "stac": {
+      "catalogRoot": "https://ic.ogc.secd.eu/stac",
+      "collectionId": "test_dss",
+      "chaincode": "dss"
+    }
+  }
+}

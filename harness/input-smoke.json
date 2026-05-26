@@ -1,0 +1,7 @@
+{
+  "url": "https://citiobs.demo.secure-dimensions.de/staplustest/v1.1/Observations",
+  "top": 100,
+  "max_observations": 50,
+  "timeout": 120,
+  "verbose": true
+}

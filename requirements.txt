@@ -1,0 +1,8 @@
+# sta_to_gpkg.py — runtime dependencies
+#
+# Required
+requests>=2.28.0        # HTTP client for STA API calls
+#
+# Optional — needed only for non-Point geometries (Polygon, LineString, etc.)
+# If absent, non-Point FoI / Location geometries are stored as NULL with a warning.
+shapely>=2.0.0          # WKB encoding of complex geometries

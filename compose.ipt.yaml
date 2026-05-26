@@ -1,0 +1,37 @@
+# Local IPT test harness — Redis + sta_to_gpkg (execute + describeProcessing)
+#
+#   docker compose -f compose.ipt.yaml up -d redis
+#   ./harness/run-ipt-cycle.sh
+#   ./harness/run-ipt-cycle.sh harness/input-smoke.json
+#
+# Redis is on host port 6380 (avoids clashing with ogc-api-processes test Redis).
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly no
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # Built once; invoked via `docker compose run` (not started by `up`).
+  sta-to-gpkg:
+    build: .
+    image: sta_to_gpkg:ipt-harness
+    init: true
+    stdin_open: true
+    tty: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # describeProcessing: no network (compose run does not support --network on all hosts).
+  sta-to-gpkg-describe:
+    image: sta_to_gpkg:ipt-harness
+    init: true
+    stdin_open: true
+    tty: false
+    network_mode: none

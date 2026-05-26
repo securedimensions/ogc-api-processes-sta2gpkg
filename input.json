@@ -1,0 +1,8 @@
+{
+  "url":     "STA URL",
+  "filter":  "a ODATA filter creteria for Observations",
+  "top":     100,
+  "timeout": 30,
+  "verbose": false,
+  "max_observations": 200
+}

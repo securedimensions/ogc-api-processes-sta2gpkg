@@ -1,0 +1,29 @@
+# Local Python virtualenv (do not commit)
+.venv/
+venv/
+lib/
+bin/
+include/
+pyvenv.cfg
+__pycache__/
+*.py[cod]
+.Python
+
+# GeoPackage outputs and logs
+*.gpkg
+*.gpkg-*
+out.gpkg
+export.gpkg
+export.log
+stderr.log
+err.txt
+
+# Harness ephemeral artifacts
+harness/work/*
+!harness/work/.gitkeep
+harness/ipt-labels.json
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

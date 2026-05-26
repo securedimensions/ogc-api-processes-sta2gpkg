@@ -1,0 +1,13 @@
+{
+  "domain": "sensorthings",
+  "output": "geopackage",
+  "software-provider": "Secure Dimensions GmbH",
+  "processing-level": "L2",
+  "processing-facility": "SECD",
+  "processing-version": "2.0.0",
+  "stac-catalog-root": "https://stac.example",
+  "stac-collection-id": "testbed-sensorthings-exports",
+  "chaincode": "testbed-sensorthings-exports",
+  "stac-api-prefix": "",
+  "stac-license": "proprietary"
+}
