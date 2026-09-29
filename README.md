@@ -2,6 +2,18 @@
 
 Export OGC SensorThings API v1.1 Observations to GeoPackage. Designed for [OGC API — Processes](https://github.com/securedimensions/OGC-API-Processes) with **IPT** support (`iptCompliant: true`).
 
+## OData `$metadata` (required)
+
+Before export, the process derives the STA service root from the Observations URL and **requires** OData CSDL JSON at:
+
+```text
+{parent-of-STA-root}/ODATA_4.01/$metadata?$format=json
+```
+
+Example: `…/staplustest/v1.1/Observations` → `…/staplustest/ODATA_4.01/$metadata?$format=json`.
+
+If that path is missing or unreadable, the process prints an error and exits. Property types from `$metadata` drive GeoPackage column affinities (e.g. `Edm.Int64` → `INTEGER`, geometries → `BLOB`).
+
 ## I/O contract
 
 | Stream | Content |

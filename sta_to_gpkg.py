@@ -4,10 +4,11 @@ SensorThings API v1.1 → GeoPackage Exporter
 Reads a JSON request document from STDIN, writes a GeoPackage to STDOUT.
 All log messages go to STDERR so they never corrupt the binary stream.
 
-On startup the script fetches the service landing page to detect:
-  • Whether the MultiDatastream extension is active
-    (checked via conformance URIs AND the entity list)
-  • The base service URL (derived automatically from the request URL)
+On startup the script:
+  • Derives the STA service root from the Observations URL
+  • Requires OData CSDL JSON at ``{parent}/ODATA_4.01/$metadata?$format=json``
+    (fatal error if missing) and uses it for GeoPackage column affinities
+  • Fetches the landing page to detect MultiDatastream
 
 The $expand is then built dynamically:
   Core:
@@ -144,11 +145,14 @@ IPT_BBOX_REQUIRED_MESSAGE = "BBOX null"
 
 
 def execution_fail(message: str, code: int = 1) -> None:
-    """Report failure: under OGC worker write message to stdout (stored on Redis job record)."""
+    """Report failure and exit. Under OGC worker, write message to stdout for Redis."""
     text = message if message.endswith("\n") else f"{message}\n"
     if os.environ.get("OGC_JOB_ID"):
         sys.stdout.buffer.write(text.encode("utf-8"))
         sys.stdout.buffer.flush()
+    else:
+        sys.stderr.write(text)
+        sys.stderr.flush()
     raise SystemExit(code)
 
 
@@ -177,22 +181,260 @@ GPKG_USER_TABLES = (
 
 
 # ---------------------------------------------------------------------------
-# Capability detection via landing page
+# Capability detection via landing page + mandatory OData $metadata
 # ---------------------------------------------------------------------------
 
 MDS_CONFORMANCE_URI = "http://www.opengis.net/spec/iot_sensing/1.1/req/multi-datastream"
+ODATA_METADATA_SEGMENT = "ODATA_4.01"
+
+
+def base_url_from_obs_url(obs_url: str) -> str:
+    """
+    Derive the service root by finding the first STA collection name in
+    the path and stripping it (plus everything after it).
+
+    Examples
+      …/v1.1/Observations                      → …/v1.1
+      …/staplus/v1.1/Observations              → …/staplus/v1.1
+      …/sta/v1.1/Things(5)/Datastreams(1)/Observations → …/sta/v1.1
+    """
+    sta_collections = (
+        "/Observations",
+        "/Datastreams",
+        "/MultiDatastreams",
+        "/Things",
+        "/Locations",
+        "/HistoricalLocations",
+        "/Sensors",
+        "/ObservedProperties",
+        "/FeaturesOfInterest",
+    )
+    parsed = urlparse(obs_url)
+    path = parsed.path
+
+    cut = len(path)
+    for col in sta_collections:
+        idx = path.find(col)
+        if idx != -1 and idx < cut:
+            cut = idx
+
+    root_path = path[:cut] if cut > 0 else "/"
+    return f"{parsed.scheme}://{parsed.netloc}{root_path}"
+
+
+def metadata_url_from_sta_root(base_url: str) -> str:
+    """
+    OData CSDL JSON next to the STA version root.
+
+    ``…/staplustest/v1.1`` → ``…/staplustest/ODATA_4.01/$metadata?$format=json``
+    """
+    parsed = urlparse(base_url.rstrip("/"))
+    parent = parsed.path.rsplit("/", 1)[0]
+    return (
+        f"{parsed.scheme}://{parsed.netloc}{parent}"
+        f"/{ODATA_METADATA_SEGMENT}/$metadata?$format=json"
+    )
+
+
+class ODataMetadata:
+    """
+    Mandatory OData 4.01 CSDL JSON ($metadata?$format=json).
+
+    Used to choose SQLite column affinities for exported STA entities.
+    """
+
+    # STA entity type short name → export table
+    ENTITY_TABLES = {
+        "Location": "locations",
+        "FeatureOfInterest": "features_of_interest",
+        "Thing": "things",
+        "ObservedProperty": "observed_properties",
+        "Sensor": "sensors",
+        "Datastream": "datastreams",
+        "MultiDatastream": "multi_datastreams",
+        "Observation": "observations",
+    }
+
+    def __init__(self, metadata_url: str, document: dict):
+        self.url = metadata_url
+        self.document = document
+        self._types: dict[str, dict[str, str]] = {}
+        self._typedef_underlying: dict[str, str] = {}
+        self._index_document(document)
+
+    @classmethod
+    def fetch(cls, metadata_url: str, session: requests.Session, timeout: int) -> "ODataMetadata":
+        """GET $metadata JSON or exit with a clear error."""
+        log.info("Fetching OData $metadata: %s", metadata_url)
+        try:
+            r = session.get(metadata_url, timeout=timeout)
+        except requests.RequestException as exc:
+            execution_fail(
+                f"Required OData $metadata is not reachable at {metadata_url}: {exc}",
+            )
+        if r.status_code == 404:
+            execution_fail(
+                f"Required OData $metadata path does not exist: {metadata_url}",
+            )
+        if r.status_code < 200 or r.status_code >= 300:
+            execution_fail(
+                f"Required OData $metadata request failed "
+                f"(HTTP {r.status_code}) at {metadata_url}",
+            )
+        try:
+            document = r.json()
+        except ValueError as exc:
+            execution_fail(
+                f"Required OData $metadata at {metadata_url} is not valid JSON: {exc}",
+            )
+        if not isinstance(document, dict) or not document:
+            execution_fail(
+                f"Required OData $metadata at {metadata_url} is empty or not an object",
+            )
+        meta = cls(metadata_url, document)
+        if not meta._types:
+            execution_fail(
+                f"Required OData $metadata at {metadata_url} "
+                f"contains no EntityType definitions",
+            )
+        log.info(
+            "OData $metadata loaded — entity types: %s",
+            sorted(meta._types),
+        )
+        return meta
+
+    def _index_document(self, document: dict) -> None:
+        for ns_name, ns_body in document.items():
+            if not isinstance(ns_body, dict) or ns_name.startswith("$"):
+                continue
+            for type_name, type_def in ns_body.items():
+                if not isinstance(type_def, dict):
+                    continue
+                kind = type_def.get("$Kind")
+                fq_name = f"{ns_name}.{type_name}" if ns_name else type_name
+                if kind == "TypeDefinition":
+                    underlying = type_def.get("$UnderlyingType") or "Edm.String"
+                    self._typedef_underlying[type_name] = underlying
+                    self._typedef_underlying[fq_name] = underlying
+                    continue
+                if kind != "EntityType":
+                    continue
+                props: dict[str, str] = {}
+                for prop_name, prop_def in type_def.items():
+                    if prop_name.startswith("$"):
+                        continue
+                    if not isinstance(prop_def, dict):
+                        continue
+                    if prop_def.get("$Kind") == "NavigationProperty":
+                        continue
+                    edm = prop_def.get("$Type") or "Edm.String"
+                    if prop_def.get("$Collection"):
+                        edm = f"Collection({edm})"
+                    props[prop_name] = edm
+                self._types[type_name] = props
+                self._types[fq_name] = props
+
+    def property_type(self, entity: str, prop: str) -> str:
+        """Return Edm (or Collection) type string; default Edm.String."""
+        props = self._types.get(entity) or {}
+        edm = props.get(prop) or "Edm.String"
+        return self._resolve_typedef(edm)
+
+    def _resolve_typedef(self, edm: str) -> str:
+        if edm.startswith("Collection(") and edm.endswith(")"):
+            inner = edm[len("Collection("):-1]
+            return f"Collection({self._resolve_typedef(inner)})"
+        short = edm.rsplit(".", 1)[-1]
+        return self._typedef_underlying.get(edm) or self._typedef_underlying.get(short) or edm
+
+    def sql_type(self, entity: str, prop: str) -> str:
+        """SQLite affinity for an entity property."""
+        return edm_to_sqlite_affinity(self.property_type(entity, prop))
+
+    def sql_id_type(self, entity: str) -> str:
+        return self.sql_type(entity, "id")
+
+    def coerce(self, entity: str, prop: str, value: Any) -> Any:
+        """Coerce a Python value for INSERT according to metadata."""
+        return coerce_for_sqlite(self.property_type(entity, prop), value)
+
+    def coerce_id(self, entity: str, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        return self.coerce(entity, "id", value)
+
+
+def edm_to_sqlite_affinity(edm_type: str) -> str:
+    """Map OData / STA Edm types to SQLite column affinities."""
+    t = (edm_type or "Edm.String").strip()
+    if t.startswith("Collection("):
+        return "TEXT"
+    short = t.rsplit(".", 1)[-1]
+    if short in ("Int16", "Int32", "Int64", "Byte", "SByte", "Boolean"):
+        return "INTEGER"
+    if short in ("Double", "Single", "Decimal"):
+        return "REAL"
+    if short in ("Geometry", "Geography"):
+        return "BLOB"
+    # String, DateTimeOffset, Date, Guid, Binary, Untyped, Complex, TM_*, Object, …
+    return "TEXT"
+
+
+def coerce_for_sqlite(edm_type: str, value: Any) -> Any:
+    """Coerce JSON/STA values to SQLite-friendly Python objects."""
+    if value is None or value == "":
+        return None
+    t = (edm_type or "Edm.String").strip()
+    if t.startswith("Collection("):
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+    short = t.rsplit(".", 1)[-1]
+    if short in ("Int16", "Int32", "Int64", "Byte", "SByte"):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+    if short == "Boolean":
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        s = str(value).strip().lower()
+        if s in ("true", "1", "yes"):
+            return 1
+        if s in ("false", "0", "no"):
+            return 0
+        return None
+    if short in ("Double", "Single", "Decimal"):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    if short in ("Geometry", "Geography"):
+        return value  # caller encodes GeoJSON → GPKG blob
+    if short in ("Untyped", "Object") or "TM_" in short or "UnitOfMeasurement" in short:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        return str(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return value if not isinstance(value, bool) else str(value)
 
 
 class ServiceCapabilities:
-    """Fetches and parses the STA landing page to detect active extensions."""
+    """Landing-page extensions + mandatory OData $metadata for column types."""
 
     def __init__(self, base_url: str, session: requests.Session, timeout: int):
         self.base_url = base_url
         self.has_multi_datastream = False
         self.entity_names: set[str] = set()
-        self._fetch(session, timeout)
+        self.metadata_url = metadata_url_from_sta_root(base_url)
+        self.metadata = ODataMetadata.fetch(self.metadata_url, session, timeout)
+        self._fetch_landing(session, timeout)
 
-    def _fetch(self, session: requests.Session, timeout: int):
+    def _fetch_landing(self, session: requests.Session, timeout: int):
         try:
             r = session.get(self.base_url, timeout=timeout)
             r.raise_for_status()
@@ -201,13 +443,11 @@ class ServiceCapabilities:
             log.warning("Could not fetch landing page (%s) — assuming core-only", exc)
             return
 
-        # Collect entity names from the value array
         for entry in data.get("value", []):
             name = entry.get("name", "")
             if name:
                 self.entity_names.add(name)
 
-        # Check conformance URIs (serverSettings.conformance)
         conformance = (
             data.get("serverSettings", {}).get("conformance", [])
             or data.get("conformance", [])
@@ -229,41 +469,7 @@ class ServiceCapabilities:
     # ------------------------------------------------------------------
     @staticmethod
     def base_url_from_obs_url(obs_url: str) -> str:
-        """
-        Derive the service root by finding the first STA collection name in
-        the path and stripping it (plus everything after it).  This preserves
-        any path prefix that precedes the collection, such as /sta/, /staplus/,
-        or /iot/sensing/v1.1/, which the old version-segment regex dropped.
-
-        Examples
-          …/v1.1/Observations                      → …/v1.1
-          …/staplus/v1.1/Observations              → …/staplus/v1.1
-          …/sta/v1.1/Things(5)/Datastreams(1)/Observations → …/sta/v1.1
-          …/api/Observations                       → …/api
-        """
-        STA_COLLECTIONS = (
-            "/Observations",
-            "/Datastreams",
-            "/MultiDatastreams",
-            "/Things",
-            "/Locations",
-            "/HistoricalLocations",
-            "/Sensors",
-            "/ObservedProperties",
-            "/FeaturesOfInterest",
-        )
-        parsed = urlparse(obs_url)
-        path = parsed.path
-
-        # Find the earliest STA collection segment and cut there
-        cut = len(path)
-        for col in STA_COLLECTIONS:
-            idx = path.find(col)
-            if idx != -1 and idx < cut:
-                cut = idx
-
-        root_path = path[:cut] if cut > 0 else "/"
-        return f"{parsed.scheme}://{parsed.netloc}{root_path}"
+        return base_url_from_obs_url(obs_url)
 
 
 # ---------------------------------------------------------------------------
@@ -970,12 +1176,25 @@ def _convex_hull_footprint_from_gpkg(con: sqlite3.Connection) -> dict | None:
 
 class GeoPackageWriter:
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, metadata: ODataMetadata):
         self.path = path
+        self.metadata = metadata
         self.con = sqlite3.connect(path)
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.execute("PRAGMA foreign_keys=ON")
         self._init_core()
+
+    def _t(self, entity: str, prop: str) -> str:
+        return self.metadata.sql_type(entity, prop)
+
+    def _id_t(self, entity: str) -> str:
+        return self.metadata.sql_id_type(entity)
+
+    def _cid(self, entity: str, value: Any) -> Any:
+        return self.metadata.coerce_id(entity, value)
+
+    def _c(self, entity: str, prop: str, value: Any) -> Any:
+        return self.metadata.coerce(entity, prop, value)
 
     # ------------------------------------------------------------------
     def _init_core(self):
@@ -1066,12 +1285,18 @@ class GeoPackageWriter:
     def write(self, graph: EntityGraph, source_url: str,
               request_count: int, has_mds: bool):
         con = self.con
+        m = self.metadata
 
         # ── locations ─────────────────────────────────────────────────
-        con.execute("""
+        con.execute(f"""
             CREATE TABLE IF NOT EXISTS locations (
-                id TEXT PRIMARY KEY, name TEXT, description TEXT,
-                encoding_type TEXT, geom BLOB, properties TEXT, thing_id TEXT
+                id {self._id_t("Location")} PRIMARY KEY,
+                name {self._t("Location", "name")},
+                description {self._t("Location", "description")},
+                encoding_type {self._t("Location", "encodingType")},
+                geom {self._t("Location", "location")},
+                properties {self._t("Location", "properties")},
+                thing_id {self._id_t("Thing")}
             )
         """)
         self._reg_feature("locations", "Locations",
@@ -1082,18 +1307,27 @@ class GeoPackageWriter:
             geojsons.append(gj)
             con.execute(
                 "INSERT OR REPLACE INTO locations VALUES (?,?,?,?,?,?,?)",
-                (str(loc["@iot.id"]), loc.get("name"), loc.get("description"),
-                 loc.get("encodingType"), _encode_geom(gj),
-                 json.dumps(loc.get("properties") or {}),
-                 str(loc.get("_thing_id", ""))),
+                (
+                    self._cid("Location", loc["@iot.id"]),
+                    self._c("Location", "name", loc.get("name")),
+                    self._c("Location", "description", loc.get("description")),
+                    self._c("Location", "encodingType", loc.get("encodingType")),
+                    _encode_geom(gj),
+                    self._c("Location", "properties", loc.get("properties") or {}),
+                    self._cid("Thing", loc.get("_thing_id")),
+                ),
             )
         self._sync_feature_bbox("locations", geojsons)
 
         # ── features_of_interest ──────────────────────────────────────
-        con.execute("""
+        con.execute(f"""
             CREATE TABLE IF NOT EXISTS features_of_interest (
-                id TEXT PRIMARY KEY, name TEXT, description TEXT,
-                encoding_type TEXT, geom BLOB, properties TEXT
+                id {self._id_t("FeatureOfInterest")} PRIMARY KEY,
+                name {self._t("FeatureOfInterest", "name")},
+                description {self._t("FeatureOfInterest", "description")},
+                encoding_type {self._t("FeatureOfInterest", "encodingType")},
+                geom {self._t("FeatureOfInterest", "feature")},
+                properties {self._t("FeatureOfInterest", "properties")}
             )
         """)
         self._reg_feature("features_of_interest", "FeaturesOfInterest",
@@ -1104,99 +1338,155 @@ class GeoPackageWriter:
             foi_geojsons.append(gj)
             con.execute(
                 "INSERT OR REPLACE INTO features_of_interest VALUES (?,?,?,?,?,?)",
-                (str(foi["@iot.id"]), foi.get("name"), foi.get("description"),
-                 foi.get("encodingType"), _encode_geom(gj),
-                 json.dumps(foi.get("properties") or {})),
+                (
+                    self._cid("FeatureOfInterest", foi["@iot.id"]),
+                    self._c("FeatureOfInterest", "name", foi.get("name")),
+                    self._c("FeatureOfInterest", "description", foi.get("description")),
+                    self._c("FeatureOfInterest", "encodingType", foi.get("encodingType")),
+                    _encode_geom(gj),
+                    self._c("FeatureOfInterest", "properties", foi.get("properties") or {}),
+                ),
             )
         self._sync_feature_bbox("features_of_interest", foi_geojsons)
 
         # ── things ────────────────────────────────────────────────────
-        con.execute("""
+        con.execute(f"""
             CREATE TABLE IF NOT EXISTS things (
-                id TEXT PRIMARY KEY, name TEXT, description TEXT, properties TEXT
+                id {self._id_t("Thing")} PRIMARY KEY,
+                name {self._t("Thing", "name")},
+                description {self._t("Thing", "description")},
+                properties {self._t("Thing", "properties")}
             )
         """)
         self._reg_attrs("things", "Things", "SensorThings Things")
         for t in graph.things.values():
-            con.execute("INSERT OR REPLACE INTO things VALUES (?,?,?,?)",
-                        (str(t["@iot.id"]), t.get("name"), t.get("description"),
-                         json.dumps(t.get("properties") or {})))
+            con.execute(
+                "INSERT OR REPLACE INTO things VALUES (?,?,?,?)",
+                (
+                    self._cid("Thing", t["@iot.id"]),
+                    self._c("Thing", "name", t.get("name")),
+                    self._c("Thing", "description", t.get("description")),
+                    self._c("Thing", "properties", t.get("properties") or {}),
+                ),
+            )
 
         # ── observed_properties ───────────────────────────────────────
-        con.execute("""
+        con.execute(f"""
             CREATE TABLE IF NOT EXISTS observed_properties (
-                id TEXT PRIMARY KEY, name TEXT, description TEXT,
-                definition TEXT, properties TEXT
+                id {self._id_t("ObservedProperty")} PRIMARY KEY,
+                name {self._t("ObservedProperty", "name")},
+                description {self._t("ObservedProperty", "description")},
+                definition {self._t("ObservedProperty", "definition")},
+                properties {self._t("ObservedProperty", "properties")}
             )
         """)
         self._reg_attrs("observed_properties", "ObservedProperties",
                         "SensorThings ObservedProperties")
         for op in graph.observed_properties.values():
-            con.execute("INSERT OR REPLACE INTO observed_properties VALUES (?,?,?,?,?)",
-                        (str(op["@iot.id"]), op.get("name"), op.get("description"),
-                         op.get("definition"), json.dumps(op.get("properties") or {})))
+            con.execute(
+                "INSERT OR REPLACE INTO observed_properties VALUES (?,?,?,?,?)",
+                (
+                    self._cid("ObservedProperty", op["@iot.id"]),
+                    self._c("ObservedProperty", "name", op.get("name")),
+                    self._c("ObservedProperty", "description", op.get("description")),
+                    self._c("ObservedProperty", "definition", op.get("definition")),
+                    self._c("ObservedProperty", "properties", op.get("properties") or {}),
+                ),
+            )
 
         # ── sensors ───────────────────────────────────────────────────
-        con.execute("""
+        con.execute(f"""
             CREATE TABLE IF NOT EXISTS sensors (
-                id TEXT PRIMARY KEY, name TEXT, description TEXT,
-                encoding_type TEXT, metadata TEXT, properties TEXT
+                id {self._id_t("Sensor")} PRIMARY KEY,
+                name {self._t("Sensor", "name")},
+                description {self._t("Sensor", "description")},
+                encoding_type {self._t("Sensor", "encodingType")},
+                metadata {self._t("Sensor", "metadata")},
+                properties {self._t("Sensor", "properties")}
             )
         """)
         self._reg_attrs("sensors", "Sensors", "SensorThings Sensors")
         for s in graph.sensors.values():
             meta = s.get("metadata")
-            con.execute("INSERT OR REPLACE INTO sensors VALUES (?,?,?,?,?,?)",
-                        (str(s["@iot.id"]), s.get("name"), s.get("description"),
-                         s.get("encodingType"),
-                         json.dumps(meta) if isinstance(meta, dict) else meta,
-                         json.dumps(s.get("properties") or {})))
+            con.execute(
+                "INSERT OR REPLACE INTO sensors VALUES (?,?,?,?,?,?)",
+                (
+                    self._cid("Sensor", s["@iot.id"]),
+                    self._c("Sensor", "name", s.get("name")),
+                    self._c("Sensor", "description", s.get("description")),
+                    self._c("Sensor", "encodingType", s.get("encodingType")),
+                    self._c("Sensor", "metadata", meta),
+                    self._c("Sensor", "properties", s.get("properties") or {}),
+                ),
+            )
 
         # ── datastreams ───────────────────────────────────────────────
-        con.execute("""
+        # unit_* columns are flattened from complex UnitOfMeasurement (always TEXT).
+        con.execute(f"""
             CREATE TABLE IF NOT EXISTS datastreams (
-                id TEXT PRIMARY KEY, name TEXT, description TEXT,
+                id {self._id_t("Datastream")} PRIMARY KEY,
+                name {self._t("Datastream", "name")},
+                description {self._t("Datastream", "description")},
                 unit_name TEXT, unit_symbol TEXT, unit_definition TEXT,
-                observation_type TEXT, phenomenon_time TEXT, result_time TEXT,
-                properties TEXT,
-                thing_id TEXT REFERENCES things(id),
-                observed_property_id TEXT REFERENCES observed_properties(id),
-                sensor_id TEXT REFERENCES sensors(id)
+                observation_type {self._t("Datastream", "observationType")},
+                phenomenon_time {self._t("Datastream", "phenomenonTime")},
+                result_time {self._t("Datastream", "resultTime")},
+                properties {self._t("Datastream", "properties")},
+                thing_id {self._id_t("Thing")} REFERENCES things(id),
+                observed_property_id {self._id_t("ObservedProperty")}
+                    REFERENCES observed_properties(id),
+                sensor_id {self._id_t("Sensor")} REFERENCES sensors(id)
             )
         """)
         self._reg_attrs("datastreams", "Datastreams", "SensorThings Datastreams")
         for ds in graph.datastreams.values():
             uom = ds.get("unitOfMeasurement") or {}
-            con.execute("INSERT OR REPLACE INTO datastreams VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (str(ds["@iot.id"]), ds.get("name"), ds.get("description"),
-                         uom.get("name"), uom.get("symbol"), uom.get("definition"),
-                         ds.get("observationType"), ds.get("phenomenonTime"), ds.get("resultTime"),
-                         json.dumps(ds.get("properties") or {}),
-                         str((ds.get("Thing") or {}).get("@iot.id", "")),
-                         str((ds.get("ObservedProperty") or {}).get("@iot.id", "")),
-                         str((ds.get("Sensor") or {}).get("@iot.id", ""))))
+            con.execute(
+                "INSERT OR REPLACE INTO datastreams VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    self._cid("Datastream", ds["@iot.id"]),
+                    self._c("Datastream", "name", ds.get("name")),
+                    self._c("Datastream", "description", ds.get("description")),
+                    uom.get("name"), uom.get("symbol"), uom.get("definition"),
+                    self._c("Datastream", "observationType", ds.get("observationType")),
+                    self._c("Datastream", "phenomenonTime", ds.get("phenomenonTime")),
+                    self._c("Datastream", "resultTime", ds.get("resultTime")),
+                    self._c("Datastream", "properties", ds.get("properties") or {}),
+                    self._cid("Thing", (ds.get("Thing") or {}).get("@iot.id")),
+                    self._cid(
+                        "ObservedProperty",
+                        (ds.get("ObservedProperty") or {}).get("@iot.id"),
+                    ),
+                    self._cid("Sensor", (ds.get("Sensor") or {}).get("@iot.id")),
+                ),
+            )
 
         # ── multi_datastreams (conditional) ───────────────────────────
         if has_mds:
-            con.execute("""
+            con.execute(f"""
                 CREATE TABLE IF NOT EXISTS multi_datastreams (
-                    id TEXT PRIMARY KEY, name TEXT, description TEXT,
+                    id {self._id_t("MultiDatastream")} PRIMARY KEY,
+                    name {self._t("MultiDatastream", "name")},
+                    description {self._t("MultiDatastream", "description")},
                     unit_names TEXT, unit_symbols TEXT, unit_definitions TEXT,
-                    observation_type TEXT,
-                    multi_observation_data_types TEXT,
-                    phenomenon_time TEXT, result_time TEXT,
-                    properties TEXT,
-                    thing_id TEXT REFERENCES things(id),
-                    sensor_id TEXT REFERENCES sensors(id)
+                    observation_type {self._t("MultiDatastream", "observationType")},
+                    multi_observation_data_types
+                        {self._t("MultiDatastream", "multiObservationDataTypes")},
+                    phenomenon_time {self._t("MultiDatastream", "phenomenonTime")},
+                    result_time {self._t("MultiDatastream", "resultTime")},
+                    properties {self._t("MultiDatastream", "properties")},
+                    thing_id {self._id_t("Thing")} REFERENCES things(id),
+                    sensor_id {self._id_t("Sensor")} REFERENCES sensors(id)
                 )
             """)
             self._reg_attrs("multi_datastreams", "MultiDatastreams",
                             "SensorThings MultiDatastreams")
-            # Junction table: MultiDatastream ↔ ObservedProperty (ordered)
-            con.execute("""
+            mds_id_t = self._id_t("MultiDatastream")
+            op_id_t = self._id_t("ObservedProperty")
+            con.execute(f"""
                 CREATE TABLE IF NOT EXISTS multi_datastream_observed_properties (
-                    multi_datastream_id TEXT REFERENCES multi_datastreams(id),
-                    observed_property_id TEXT REFERENCES observed_properties(id),
+                    multi_datastream_id {mds_id_t} REFERENCES multi_datastreams(id),
+                    observed_property_id {op_id_t} REFERENCES observed_properties(id),
                     rank INTEGER,
                     PRIMARY KEY (multi_datastream_id, observed_property_id)
                 )
@@ -1205,44 +1495,70 @@ class GeoPackageWriter:
                             "MDS-OP Links",
                             "MultiDatastream ↔ ObservedProperty junction")
 
-            for mds in graph.multi_datastreams.values():
-                uoms = mds.get("unitOfMeasurements") or []
-                names  = json.dumps([u.get("name")       for u in uoms])
-                syms   = json.dumps([u.get("symbol")     for u in uoms])
-                defs   = json.dumps([u.get("definition") for u in uoms])
+            for mds_ent in graph.multi_datastreams.values():
+                uoms = mds_ent.get("unitOfMeasurements") or []
+                names = json.dumps([u.get("name") for u in uoms])
+                syms = json.dumps([u.get("symbol") for u in uoms])
+                defs = json.dumps([u.get("definition") for u in uoms])
                 con.execute(
                     "INSERT OR REPLACE INTO multi_datastreams VALUES "
                     "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (str(mds["@iot.id"]), mds.get("name"), mds.get("description"),
-                     names, syms, defs,
-                     mds.get("observationType"),
-                     json.dumps(mds.get("multiObservationDataTypes") or []),
-                     mds.get("phenomenonTime"), mds.get("resultTime"),
-                     json.dumps(mds.get("properties") or {}),
-                     str((mds.get("Thing") or {}).get("@iot.id", "")),
-                     str((mds.get("Sensor") or {}).get("@iot.id", ""))))
+                    (
+                        self._cid("MultiDatastream", mds_ent["@iot.id"]),
+                        self._c("MultiDatastream", "name", mds_ent.get("name")),
+                        self._c("MultiDatastream", "description", mds_ent.get("description")),
+                        names, syms, defs,
+                        self._c(
+                            "MultiDatastream", "observationType",
+                            mds_ent.get("observationType"),
+                        ),
+                        self._c(
+                            "MultiDatastream", "multiObservationDataTypes",
+                            mds_ent.get("multiObservationDataTypes") or [],
+                        ),
+                        self._c(
+                            "MultiDatastream", "phenomenonTime",
+                            mds_ent.get("phenomenonTime"),
+                        ),
+                        self._c(
+                            "MultiDatastream", "resultTime",
+                            mds_ent.get("resultTime"),
+                        ),
+                        self._c(
+                            "MultiDatastream", "properties",
+                            mds_ent.get("properties") or {},
+                        ),
+                        self._cid("Thing", (mds_ent.get("Thing") or {}).get("@iot.id")),
+                        self._cid("Sensor", (mds_ent.get("Sensor") or {}).get("@iot.id")),
+                    ),
+                )
 
-                ops = mds.get("ObservedProperties") or []
+                ops = mds_ent.get("ObservedProperties") or []
                 for rank, op in enumerate(ops):
                     con.execute(
                         "INSERT OR REPLACE INTO multi_datastream_observed_properties "
                         "VALUES (?,?,?)",
-                        (str(mds["@iot.id"]), str(op["@iot.id"]), rank))
+                        (
+                            self._cid("MultiDatastream", mds_ent["@iot.id"]),
+                            self._cid("ObservedProperty", op["@iot.id"]),
+                            rank,
+                        ),
+                    )
 
         # ── observations ──────────────────────────────────────────────
-        # The multi_datastream_id FK is only added when the MDS table exists.
         mds_fk = "REFERENCES multi_datastreams(id)" if has_mds else ""
         con.execute(f"""
             CREATE TABLE IF NOT EXISTS observations (
-                id TEXT PRIMARY KEY,
-                phenomenon_time TEXT,
-                result_time TEXT,
-                result TEXT,
-                result_quality TEXT,
-                parameters TEXT,
-                datastream_id TEXT REFERENCES datastreams(id),
-                multi_datastream_id TEXT {mds_fk},
-                feature_of_interest_id TEXT REFERENCES features_of_interest(id)
+                id {self._id_t("Observation")} PRIMARY KEY,
+                phenomenon_time {self._t("Observation", "phenomenonTime")},
+                result_time {self._t("Observation", "resultTime")},
+                result {self._t("Observation", "result")},
+                result_quality {self._t("Observation", "resultQuality")},
+                parameters {self._t("Observation", "parameters")},
+                datastream_id {self._id_t("Datastream")} REFERENCES datastreams(id),
+                multi_datastream_id {self._id_t("MultiDatastream")} {mds_fk},
+                feature_of_interest_id {self._id_t("FeatureOfInterest")}
+                    REFERENCES features_of_interest(id)
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_obs_ds  ON observations(datastream_id)")
@@ -1251,15 +1567,24 @@ class GeoPackageWriter:
         con.execute("CREATE INDEX IF NOT EXISTS idx_obs_foi ON observations(feature_of_interest_id)")
         self._reg_attrs("observations", "Observations", "SensorThings Observations")
 
-        rows = [
-            (o["id"], _sta_time_to_storage(o.get("phenomenonTime")),
-             _sta_time_to_storage(o.get("resultTime")),
-             json.dumps(o["result"]) if not isinstance(o["result"], str) else o["result"],
-             o.get("resultQuality"), o.get("parameters"),
-             o.get("datastream_id"), o.get("multi_datastream_id"),
-             o.get("feature_of_interest_id"))
-            for o in graph.observations
-        ]
+        rows = []
+        for o in graph.observations:
+            result_val = o["result"]
+            if not isinstance(result_val, str):
+                result_val = json.dumps(result_val) if result_val is not None else None
+            rows.append((
+                self._cid("Observation", o["id"]),
+                self._c("Observation", "phenomenonTime",
+                        _sta_time_to_storage(o.get("phenomenonTime"))),
+                self._c("Observation", "resultTime",
+                        _sta_time_to_storage(o.get("resultTime"))),
+                self._c("Observation", "result", result_val),
+                self._c("Observation", "resultQuality", o.get("resultQuality")),
+                self._c("Observation", "parameters", o.get("parameters")),
+                self._cid("Datastream", o.get("datastream_id")),
+                self._cid("MultiDatastream", o.get("multi_datastream_id")),
+                self._cid("FeatureOfInterest", o.get("feature_of_interest_id")),
+            ))
         con.executemany(
             "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?,?,?)", rows
         )
@@ -1273,6 +1598,7 @@ class GeoPackageWriter:
         self._reg_attrs("_export_metadata", "Export Metadata", "Export provenance")
         con.executemany("INSERT OR REPLACE INTO _export_metadata VALUES (?,?)", [
             ("source_url",                  source_url),
+            ("odata_metadata_url",          m.url),
             ("export_time",                 datetime.now(timezone.utc).isoformat()),
             ("sta_version",                 "1.1"),
             ("multi_datastream_extension",  str(has_mds)),
@@ -2071,6 +2397,7 @@ def run_export(req: dict, output_path: str) -> dict:
 
     base_url = ServiceCapabilities.base_url_from_obs_url(obs_url)
     log.info("Service root: %s", base_url)
+    log.info("OData $metadata (required): %s", metadata_url_from_sta_root(base_url))
 
     emit_progress(2)
     probe_session = requests.Session()
@@ -2110,7 +2437,7 @@ def run_export(req: dict, output_path: str) -> dict:
     emit_progress(85)
     log.info("Writing GeoPackage…")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    gpkg = GeoPackageWriter(output_path)
+    gpkg = GeoPackageWriter(output_path, caps.metadata)
     gpkg.write(graph, source_url=obs_url,
                request_count=client.request_count,
                has_mds=caps.has_multi_datastream)
