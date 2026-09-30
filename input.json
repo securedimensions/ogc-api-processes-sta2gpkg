@@ -1,6 +1,7 @@
 {
   "url":     "STA URL",
   "filter":  "a ODATA filter creteria for Observations",
+  "orderby": "phenomenonTime desc",
   "top":     100,
   "timeout": 30,
   "verbose": false,

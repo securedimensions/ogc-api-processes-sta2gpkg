@@ -56,8 +56,16 @@ USER appuser
 # Execute: JSON on stdin → GeoPackage binary on stdout (logs + OGC_PROCESSING_META on stderr).
 # IPT describe: OGC_ACTION=describeProcessing, framework context JSON on stdin → STAC Item on stdout.
 #
-# Usage:
+# Usage (SensorThings):
 #   echo '{"url":"https://example.org/v1.1/Observations"}' \
 #     | docker run --rm -i sta_to_gpkg > export.gpkg
+#
+# Usage (STAplus):
+#   echo '{"url":"https://example.org/v1.1/Observations"}' \
+#     | docker run --rm -i sta_to_gpkg --staplus > export.gpkg
+#
+# Usage (STAplus + DGGS Cell):
+#   echo '{"url":"https://example.org/v1.1/Observations"}' \
+#     | docker run --rm -i sta_to_gpkg --staplus --dggs > export.gpkg
 #
 ENTRYPOINT ["python", "sta_to_gpkg.py"]

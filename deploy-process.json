@@ -21,6 +21,13 @@
         "type": "string"
       }
     },
+    "orderby": {
+      "title": "OData $orderby",
+      "description": "Optional OData orderby applied to Observations (e.g. phenomenonTime desc).",
+      "schema": {
+        "type": "string"
+      }
+    },
     "top": {
       "title": "Page size",
       "description": "OData $top page size when paging Observations.",

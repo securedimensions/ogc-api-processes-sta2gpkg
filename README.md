@@ -14,11 +14,34 @@ Example: `…/staplustest/v1.1/Observations` → `…/staplustest/ODATA_4.01/$me
 
 If that path is missing or unreadable, the process prints an error and exits. Property types from `$metadata` drive GeoPackage column affinities (e.g. `Edm.Int64` → `INTEGER`, geometries → `BLOB`).
 
+## Optional extensions (`--staplus` / `--dggs`)
+
+`sta_to_gpkg.py` is the single entry point. Enable extras via CLI flags (combinable):
+
+| Flag | Adds | Requires on landing page |
+|------|------|--------------------------|
+| `--staplus` | Party, License, Campaign, ObservationGroup, Relation + link tables | `Parties`, `Licenses`, `Campaigns`, `ObservationGroups`, `Relations` |
+| `--dggs` | `cells` feature layer (`zoneId`, `zoneLevel`, `system`, `boundary`) + `cell_id` FKs | `Cells` |
+
+```bash
+# Core SensorThings
+echo '{"url":"https://example.org/v1.1/Observations","max_observations":50}' \
+  | python sta_to_gpkg.py > out.gpkg
+
+# STAplus
+echo '{"url":"https://citiobs.demo.secure-dimensions.de/staplustest/v1.1/Observations","max_observations":50}' \
+  | python sta_to_gpkg.py --staplus > staplus.gpkg
+
+# STAplus + DGGS Cell
+echo '{"url":"https://YOUR-DGGS-SERVER/v1.1/Observations","max_observations":50,"orderby":"phenomenonTime desc"}' \
+  | python sta_to_gpkg.py --staplus --dggs > staplus_dggs.gpkg
+```
+
 ## I/O contract
 
 | Stream | Content |
 |--------|---------|
-| **stdin** | JSON request (`url`, optional `filter`, `max_observations`, …) |
+| **stdin** | JSON request (`url`, optional `filter`, `orderby`, `max_observations`, …) |
 | **stdout** | GeoPackage bytes on success; UTF-8 error text on failure (under worker) |
 | **stderr** | Machine-readable lines only under `OGC_JOB_ID` (see below) |
 
@@ -52,13 +75,14 @@ pip install requests shapely
 
 ### 2. Run an export
 
-Use a real STA **Observations** URL and optional OData `$filter` (same fields as [deploy-process.json](deploy-process.json)):
+Use a real STA **Observations** URL and optional OData `$filter` / `$orderby` (same fields as [deploy-process.json](deploy-process.json)):
 
 ```bash
 cat > input.json <<'EOF'
 {
   "url": "https://YOUR-SERVER/v1.1/Observations",
   "filter": "phenomenonTime ge 2024-01-01T00:00:00Z",
+  "orderby": "phenomenonTime desc",
   "top": 1000,
   "timeout": 120,
   "verbose": true,

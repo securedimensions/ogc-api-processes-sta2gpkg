@@ -1,7 +1,8 @@
 {
-  "url": "https://citiobs.demo.secure-dimensions.de/staplustest/v1.1/Observations",
-  "top": 100,
+  "url": "https://citiobs.demo.secure-dimensions.de/stapluscelltest/v1.1/Observations",
+  "top": 1000,
   "max_observations": 50,
   "timeout": 120,
-  "verbose": true
+  "verbose": true,
+  "orderby": "phenomenonTime desc"
 }

@@ -6,8 +6,9 @@ All log messages go to STDERR so they never corrupt the binary stream.
 
 On startup the script:
   • Derives the STA service root from the Observations URL
-  • Requires OData CSDL JSON at ``{parent}/ODATA_4.01/$metadata?$format=json``
-    (fatal error if missing) and uses it for GeoPackage column affinities
+  • Requires OData CSDL JSON at ``{serviceParent}/ODATA_4.01/$metadata?$format=json``
+    (STA version segment such as ``v1.1`` is stripped; fatal if missing)
+    and uses it for GeoPackage column affinities
   • Fetches the landing page to detect MultiDatastream
 
 The $expand is then built dynamically:
@@ -22,16 +23,24 @@ STDIN JSON schema
   {
     "url":     "https://example.org/v1.1/Observations",  -- required
     "filter":  "phenomenonTime ge 2024-01-01T00:00:00Z", -- optional OData $filter
+    "orderby": "phenomenonTime desc",                    -- optional OData $orderby
     "top":     1000,                                      -- optional page size (default 1000)
     "max_observations": 5000,                             -- fetch exactly this many when server has enough (0 = no limit)
     "timeout": 30,                                        -- optional HTTP timeout seconds (default 30)
     "verbose": false                                      -- optional debug logging (default false)
   }
 
+Optional CLI flags
+------------------
+  --staplus   Enable STAplus entities (Party, License, Campaign, ObservationGroup, Relation)
+  --dggs      Enable STA-DGGS Cell entities (cells feature layer + cell_id FKs)
+  Flags may be combined:  python sta_to_gpkg.py --staplus --dggs < request.json > out.gpkg
+
 Usage
 -----
   echo '{"url": "https://example.org/v1.1/Observations"}' | python sta_to_gpkg.py > out.gpkg
-  cat request.json | python sta_to_gpkg.py > out.gpkg 2>export.log
+  cat request.json | python sta_to_gpkg.py --staplus > out.gpkg 2>export.log
+  cat request.json | python sta_to_gpkg.py --staplus --dggs > out.gpkg
 
 IPT (OGC API Processes)
 -----------------------
@@ -58,8 +67,12 @@ GeoPackage tables produced
   sensors               — Sensor hardware metadata
   observations          — Observation results + timestamps
   _export_metadata      — Provenance (source URL, time, request count, …)
+
+  With --staplus: parties, licenses, campaigns, observation_groups, relations + link tables
+  With --dggs:    cells (feature layer) and cell_id on observations/datastreams
 """
 
+import argparse
 import hashlib
 import io
 import json
@@ -208,6 +221,14 @@ def base_url_from_obs_url(obs_url: str) -> str:
         "/Sensors",
         "/ObservedProperties",
         "/FeaturesOfInterest",
+        # STAplus
+        "/Parties",
+        "/Licenses",
+        "/Campaigns",
+        "/ObservationGroups",
+        "/Relations",
+        # STA-DGGS
+        "/Cells",
     )
     parsed = urlparse(obs_url)
     path = parsed.path
@@ -222,16 +243,28 @@ def base_url_from_obs_url(obs_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{root_path}"
 
 
+# Trailing STA path version (e.g. v1.0, v1.1) — never part of the $metadata URL.
+_STA_VERSION_SEGMENT = re.compile(r"^v\d+\.\d+$", re.IGNORECASE)
+
+
 def metadata_url_from_sta_root(base_url: str) -> str:
     """
-    OData CSDL JSON next to the STA version root.
+    OData CSDL JSON sibling of the STA service (version path omitted).
 
-    ``…/staplustest/v1.1`` → ``…/staplustest/ODATA_4.01/$metadata?$format=json``
+    The STA version segment (``v1.1``, ``v1.0``, …) must not appear in the
+    $metadata URL:
+
+      ``…/staplustest/v1.1`` → ``…/staplustest/ODATA_4.01/$metadata?$format=json``
+      ``…/FROST-Server/v1.1`` → ``…/FROST-Server/ODATA_4.01/$metadata?$format=json``
+      ``…/SensorThings``     → ``…/SensorThings/ODATA_4.01/$metadata?$format=json``
     """
     parsed = urlparse(base_url.rstrip("/"))
-    parent = parsed.path.rsplit("/", 1)[0]
+    parts = [p for p in parsed.path.split("/") if p]
+    while parts and _STA_VERSION_SEGMENT.match(parts[-1]):
+        parts.pop()
+    root_path = ("/" + "/".join(parts)) if parts else ""
     return (
-        f"{parsed.scheme}://{parsed.netloc}{parent}"
+        f"{parsed.scheme}://{parsed.netloc}{root_path}"
         f"/{ODATA_METADATA_SEGMENT}/$metadata?$format=json"
     )
 
@@ -476,39 +509,47 @@ class ServiceCapabilities:
 # Dynamic $expand builder
 # ---------------------------------------------------------------------------
 
-def build_expand(has_mds: bool) -> str:
+def build_expand(has_mds: bool, *, staplus: bool = False, dggs: bool = False) -> str:
     """
-    Build the $expand string based on detected capabilities.
+    Build the $expand string based on detected capabilities and CLI flags.
 
     Always included
     ---------------
     • Datastream → ObservedProperty, Sensor, Thing → Locations
-    • FeatureOfInterest   (geometry of the observation itself)
+    • FeatureOfInterest
 
-    When MultiDatastream is active
-    ------------------------------
-    • MultiDatastream → ObservedProperties (list), Sensor, Thing → Locations
+    --staplus adds Party / License / Campaigns / ObservationGroups / Relations
+    --dggs adds Cell($expand=Parent) on Observation and streams
     """
+    thing_nav = ["Locations"]
+    if staplus:
+        thing_nav.append("Party")
+    thing_expand = f"Thing($expand={','.join(thing_nav)})"
+
+    stream_extra: list[str] = []
+    if staplus:
+        stream_extra.extend(["Party", "License", "Campaigns"])
+    if dggs:
+        stream_extra.append("Cell($expand=Parent)")
+    stream_tail = ("," + ",".join(stream_extra)) if stream_extra else ""
+
     parts = [
-        # Core Datastream branch
         "Datastream("
-        "$expand="
-        "ObservedProperty,"
-        "Sensor,"
-        "Thing($expand=Locations)"
+        f"$expand=ObservedProperty,Sensor,{thing_expand}{stream_tail}"
         ")",
-        # FeatureOfInterest is always present in STA core
         "FeatureOfInterest",
     ]
+    if dggs:
+        parts.append("Cell($expand=Parent)")
+    if staplus:
+        parts.append(
+            "ObservationGroups($expand=Party,License,Campaigns,Relations)"
+        )
 
     if has_mds:
         parts.append(
-            # MultiDatastream uses ObservedProperties (plural) per STA spec
             "MultiDatastream("
-            "$expand="
-            "ObservedProperties,"
-            "Sensor,"
-            "Thing($expand=Locations)"
+            f"$expand=ObservedProperties,Sensor,{thing_expand}{stream_tail}"
             ")"
         )
 
@@ -528,6 +569,7 @@ class STAClient:
         capabilities: ServiceCapabilities,
         page_size: int = 1000,
         timeout: int = 30,
+        expand: str | None = None,
     ):
         self.obs_url = obs_url
         self.caps = capabilities
@@ -537,7 +579,9 @@ class STAClient:
         self.obs_total: int | None = None
         self.session.headers["Accept"] = "application/json"
         self._request_count = 0
-        self._expand = build_expand(capabilities.has_multi_datastream)
+        self._expand = expand if expand is not None else build_expand(
+            capabilities.has_multi_datastream,
+        )
         log.info("$expand = %s", self._expand)
 
     # ------------------------------------------------------------------
@@ -563,7 +607,7 @@ class STAClient:
         Append OData query parameters to a URL without percent-encoding them.
 
         requests' params= kwarg encodes every character including $ ( ) , which
-        breaks OData operators like $expand, $filter, and $top on most backends.
+        breaks OData operators like $expand, $filter, $orderby, and $top on most backends.
         Instead we join the key=value pairs with & and append them raw.
         Values are cast to str so callers can pass ints (e.g. $top=1000).
         """
@@ -844,7 +888,11 @@ def _encode_geom(geojson: dict | None) -> bytes | None:
         from shapely.geometry import shape
         from shapely.wkb import dumps as wkb_dumps
         geom = shape(geojson)
-        return _gpkg_header() + wkb_dumps(geom, little_endian=True)
+        try:
+            wkb = wkb_dumps(geom, byte_order=1)  # shapely 2.x
+        except TypeError:
+            wkb = wkb_dumps(geom, little_endian=True)  # shapely 1.x
+        return _gpkg_header() + wkb
     except Exception as exc:
         log.warning("Could not encode geometry %s: %s", gtype, exc)
         return None
@@ -975,7 +1023,7 @@ def _collect_lon_lat_from_gpkg_blob(blob: bytes | None, lons: list, lats: list) 
             lats.append(y)
 
 
-GPKG_FEATURE_TABLES = ("locations", "features_of_interest")
+GPKG_FEATURE_TABLES = ("locations", "features_of_interest", "cells")
 
 
 def _collect_lon_lat_from_gpkg(con: sqlite3.Connection, lons: list, lats: list) -> None:
@@ -1589,6 +1637,9 @@ class GeoPackageWriter:
             "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?,?,?)", rows
         )
 
+        # Extension hook (e.g. STAplus tables) before provenance metadata.
+        self.write_extra(graph, has_mds)
+
         # ── export metadata ───────────────────────────────────────────
         con.execute("""
             CREATE TABLE IF NOT EXISTS _export_metadata (
@@ -1596,7 +1647,7 @@ class GeoPackageWriter:
             )
         """)
         self._reg_attrs("_export_metadata", "Export Metadata", "Export provenance")
-        con.executemany("INSERT OR REPLACE INTO _export_metadata VALUES (?,?)", [
+        meta_rows = [
             ("source_url",                  source_url),
             ("odata_metadata_url",          m.url),
             ("export_time",                 datetime.now(timezone.utc).isoformat()),
@@ -1611,10 +1662,19 @@ class GeoPackageWriter:
             ("features_of_interest_count",  str(len(graph.features_of_interest))),
             ("observed_properties_count",   str(len(graph.observed_properties))),
             ("sensors_count",               str(len(graph.sensors))),
-        ])
+        ]
+        meta_rows.extend(self.extra_export_metadata(graph, has_mds))
+        con.executemany("INSERT OR REPLACE INTO _export_metadata VALUES (?,?)", meta_rows)
 
         con.commit()
         log.info("GeoPackage committed to %s", self.path)
+
+    def write_extra(self, graph: EntityGraph, has_mds: bool) -> None:
+        """Hook for subclasses (e.g. STAplus) to append tables after core STA entities."""
+
+    def extra_export_metadata(self, graph: EntityGraph, has_mds: bool) -> list[tuple[str, str]]:
+        """Extra ``_export_metadata`` rows from subclasses."""
+        return []
 
     def close(self):
         self.con.close()
@@ -1623,6 +1683,742 @@ class GeoPackageWriter:
         with open(self.path, "r+b") as f:
             f.seek(60)
             f.write(struct.pack(">I", int.from_bytes(b"GPKG", "big")))
+
+
+
+# ---------------------------------------------------------------------------
+# Optional STAplus / DGGS (Cell) extensions (--staplus / --dggs)
+# ---------------------------------------------------------------------------
+
+STAPLUS_REQUIRED_ENTITIES = frozenset({
+    "Parties",
+    "Licenses",
+    "Campaigns",
+    "ObservationGroups",
+    "Relations",
+})
+
+STAPLUS_USER_TABLES = (
+    "parties",
+    "licenses",
+    "campaigns",
+    "observation_groups",
+    "relations",
+    "datastream_campaigns",
+    "multi_datastream_campaigns",
+    "observation_group_observations",
+    "observation_group_campaigns",
+    "observation_group_relations",
+)
+
+DGGS_REQUIRED_ENTITIES = frozenset({"Cells"})
+DGGS_USER_TABLES = ("cells",)
+
+
+def extension_profile(staplus: bool, dggs: bool) -> dict[str, Any]:
+    """Resolve banner, required entity sets, and extra GeoPackage tables."""
+    labels = ["SensorThings"]
+    if staplus:
+        labels.append("STAplus")
+    if dggs:
+        labels.append("DGGS")
+    required: set[str] = set()
+    tables: list[str] = []
+    if staplus:
+        required |= set(STAPLUS_REQUIRED_ENTITIES)
+        tables.extend(STAPLUS_USER_TABLES)
+    if dggs:
+        required |= set(DGGS_REQUIRED_ENTITIES)
+        tables.extend(DGGS_USER_TABLES)
+    return {
+        "banner": " + ".join(labels) + " → GeoPackage",
+        "require_entities": frozenset(required) if required else None,
+        "extra_user_tables": tuple(tables),
+    }
+
+
+def _boundary_geojson(boundary: Any) -> dict | None:
+    """Normalize Cell.boundary to a GeoJSON geometry dict when possible."""
+    if not boundary:
+        return None
+    if isinstance(boundary, dict) and boundary.get("type"):
+        if boundary.get("type") == "Feature":
+            geom = boundary.get("geometry")
+            return geom if isinstance(geom, dict) else None
+        return boundary
+    if isinstance(boundary, str):
+        text = boundary.strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return _boundary_geojson(parsed)
+        try:
+            from shapely import wkt
+            from shapely.geometry import mapping
+            return mapping(wkt.loads(text))
+        except Exception:
+            return None
+    return None
+
+
+class ExtensibleEntityGraph(EntityGraph):
+    """Core EntityGraph plus optional STAplus and/or DGGS Cell harvest."""
+
+    def __init__(self, *, staplus: bool = False, dggs: bool = False):
+        super().__init__()
+        self.enable_staplus = staplus
+        self.enable_dggs = dggs
+
+        if staplus:
+            self.parties: dict[str, dict] = {}
+            self.licenses: dict[str, dict] = {}
+            self.campaigns: dict[str, dict] = {}
+            self.observation_groups: dict[str, dict] = {}
+            self.relations: dict[str, dict] = {}
+            self.datastream_campaigns: set[tuple[str, str]] = set()
+            self.multi_datastream_campaigns: set[tuple[str, str]] = set()
+            self.observation_group_observations: set[tuple[str, str]] = set()
+            self.observation_group_campaigns: set[tuple[str, str]] = set()
+            self.observation_group_relations: set[tuple[str, str]] = set()
+            self.datastream_party: dict[str, str] = {}
+            self.datastream_license: dict[str, str] = {}
+            self.multi_datastream_party: dict[str, str] = {}
+            self.multi_datastream_license: dict[str, str] = {}
+            self.thing_party: dict[str, str] = {}
+
+        if dggs:
+            self.cells: dict[str, dict] = {}
+            self.observation_cell: dict[str, str] = {}
+            self.datastream_cell: dict[str, str] = {}
+            self.multi_datastream_cell: dict[str, str] = {}
+
+    # ── STAplus helpers ───────────────────────────────────────────────
+
+    def _put_party(self, party: dict | None) -> str | None:
+        if not party or party.get("@iot.id") is None:
+            return None
+        pid = str(party["@iot.id"])
+        if pid not in self.parties:
+            self.parties[pid] = party
+        return pid
+
+    def _put_license(self, license_: dict | None) -> str | None:
+        if not license_ or license_.get("@iot.id") is None:
+            return None
+        lid = str(license_["@iot.id"])
+        if lid not in self.licenses:
+            self.licenses[lid] = license_
+        return lid
+
+    def _put_campaign(self, campaign: dict | None) -> str | None:
+        if not campaign or campaign.get("@iot.id") is None:
+            return None
+        cid = str(campaign["@iot.id"])
+        if cid not in self.campaigns:
+            self.campaigns[cid] = campaign
+            party_id = self._put_party(campaign.get("Party"))
+            if party_id:
+                campaign["_party_id"] = party_id
+            lic_id = self._put_license(campaign.get("License"))
+            if lic_id:
+                campaign["_license_id"] = lic_id
+        return cid
+
+    def _put_relation(self, rel: dict | None) -> str | None:
+        if not rel or rel.get("@iot.id") is None:
+            return None
+        rid = str(rel["@iot.id"])
+        if rid not in self.relations:
+            subj = rel.get("Subject") or {}
+            obj = rel.get("Object") or {}
+            self.relations[rid] = {
+                **rel,
+                "_subject_id": (
+                    str(subj["@iot.id"]) if subj.get("@iot.id") is not None else None
+                ),
+                "_object_id": (
+                    str(obj["@iot.id"]) if obj.get("@iot.id") is not None else None
+                ),
+            }
+        return rid
+
+    def _ingest_stream_staplus(self, stream: dict, is_mds: bool) -> None:
+        sid = str(stream["@iot.id"])
+        party_id = self._put_party(stream.get("Party"))
+        lic_id = self._put_license(stream.get("License"))
+        if is_mds:
+            if party_id:
+                self.multi_datastream_party[sid] = party_id
+            if lic_id:
+                self.multi_datastream_license[sid] = lic_id
+            for camp in stream.get("Campaigns") or []:
+                cid = self._put_campaign(camp)
+                if cid:
+                    self.multi_datastream_campaigns.add((sid, cid))
+        else:
+            if party_id:
+                self.datastream_party[sid] = party_id
+            if lic_id:
+                self.datastream_license[sid] = lic_id
+            for camp in stream.get("Campaigns") or []:
+                cid = self._put_campaign(camp)
+                if cid:
+                    self.datastream_campaigns.add((sid, cid))
+
+        thing = stream.get("Thing") or {}
+        if thing.get("@iot.id") is not None:
+            tid = str(thing["@iot.id"])
+            tparty = self._put_party(thing.get("Party"))
+            if tparty:
+                self.thing_party[tid] = tparty
+
+    # ── DGGS helpers ──────────────────────────────────────────────────
+
+    def _put_cell(self, cell: dict | None) -> str | None:
+        if not cell:
+            return None
+        cid = cell.get("@iot.id")
+        if cid is None:
+            cid = cell.get("zoneId")
+        if cid is None:
+            return None
+        cid = str(cid)
+        if cid not in self.cells:
+            parent = cell.get("Parent")
+            parent_id = None
+            if isinstance(parent, dict):
+                parent_id = self._put_cell(parent)
+            self.cells[cid] = {**cell, "@iot.id": cid, "_parent_id": parent_id}
+        else:
+            stored = self.cells[cid]
+            for key in (
+                "zoneId", "zoneLevel", "system", "encodingType",
+                "boundary", "properties",
+            ):
+                if stored.get(key) is None and cell.get(key) is not None:
+                    stored[key] = cell[key]
+            if stored.get("_parent_id") is None and isinstance(cell.get("Parent"), dict):
+                stored["_parent_id"] = self._put_cell(cell.get("Parent"))
+        return cid
+
+    def _ingest_stream_cell(self, stream: dict, is_mds: bool) -> None:
+        sid = str(stream["@iot.id"])
+        cell_id = self._put_cell(stream.get("Cell"))
+        if not cell_id:
+            return
+        if is_mds:
+            self.multi_datastream_cell[sid] = cell_id
+        else:
+            self.datastream_cell[sid] = cell_id
+
+    def ingest(self, obs: dict) -> None:
+        before = len(self.observations)
+        super().ingest(obs)
+        if len(self.observations) == before:
+            return
+
+        oid = str(obs.get("@iot.id"))
+        ds = obs.get("Datastream")
+        mds = obs.get("MultiDatastream")
+
+        if self.enable_staplus:
+            if ds:
+                self._ingest_stream_staplus(ds, is_mds=False)
+            if mds:
+                self._ingest_stream_staplus(mds, is_mds=True)
+            for og in obs.get("ObservationGroups") or []:
+                if og.get("@iot.id") is None:
+                    continue
+                gid = str(og["@iot.id"])
+                if gid not in self.observation_groups:
+                    party_id = self._put_party(og.get("Party"))
+                    lic_id = self._put_license(og.get("License"))
+                    self.observation_groups[gid] = {
+                        **og,
+                        "_party_id": party_id,
+                        "_license_id": lic_id,
+                    }
+                self.observation_group_observations.add((gid, oid))
+                for camp in og.get("Campaigns") or []:
+                    cid = self._put_campaign(camp)
+                    if cid:
+                        self.observation_group_campaigns.add((gid, cid))
+                for rel in og.get("Relations") or []:
+                    rid = self._put_relation(rel)
+                    if rid:
+                        self.observation_group_relations.add((gid, rid))
+
+        if self.enable_dggs:
+            cell_id = self._put_cell(obs.get("Cell"))
+            if cell_id:
+                self.observation_cell[oid] = cell_id
+            if ds:
+                self._ingest_stream_cell(ds, is_mds=False)
+            if mds:
+                self._ingest_stream_cell(mds, is_mds=True)
+
+    def summary(self) -> str:
+        s = super().summary()
+        if self.enable_staplus:
+            s += (
+                f", parties={len(self.parties)}, licenses={len(self.licenses)}, "
+                f"campaigns={len(self.campaigns)}, "
+                f"observation_groups={len(self.observation_groups)}, "
+                f"relations={len(self.relations)}"
+            )
+        if self.enable_dggs:
+            s += f", cells={len(self.cells)}"
+        return s
+
+
+class ExtensibleGeoPackageWriter(GeoPackageWriter):
+    """Writes optional STAplus and/or DGGS tables after core STA entities."""
+
+    def __init__(
+        self,
+        path: str,
+        metadata: "ODataMetadata",
+        *,
+        staplus: bool = False,
+        dggs: bool = False,
+    ):
+        super().__init__(path, metadata)
+        self.enable_staplus = staplus
+        self.enable_dggs = dggs
+
+    def write_extra(self, graph: EntityGraph, has_mds: bool) -> None:
+        if self.enable_staplus and isinstance(graph, ExtensibleEntityGraph):
+            self._write_staplus(graph, has_mds)
+        if self.enable_dggs and isinstance(graph, ExtensibleEntityGraph):
+            self._write_dggs(graph, has_mds)
+
+    def extra_export_metadata(
+        self, graph: EntityGraph, has_mds: bool,
+    ) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        if self.enable_staplus and isinstance(graph, ExtensibleEntityGraph):
+            rows.extend([
+                ("staplus_extension", "true"),
+                ("parties_count", str(len(graph.parties))),
+                ("licenses_count", str(len(graph.licenses))),
+                ("campaigns_count", str(len(graph.campaigns))),
+                ("observation_groups_count", str(len(graph.observation_groups))),
+                ("relations_count", str(len(graph.relations))),
+            ])
+        elif self.enable_staplus:
+            rows.append(("staplus_extension", "false"))
+        if self.enable_dggs and isinstance(graph, ExtensibleEntityGraph):
+            rows.extend([
+                ("dggs_cell_extension", "true"),
+                ("cells_count", str(len(graph.cells))),
+            ])
+        elif self.enable_dggs:
+            rows.append(("dggs_cell_extension", "false"))
+        return rows
+
+    def _write_staplus(self, graph: ExtensibleEntityGraph, has_mds: bool) -> None:
+        con = self.con
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS parties (
+                id {self._id_t("Party")} PRIMARY KEY,
+                description {self._t("Party", "description")},
+                auth_id {self._t("Party", "authId")},
+                role {self._t("Party", "role")},
+                display_name {self._t("Party", "displayName")}
+            )
+        """)
+        self._reg_attrs("parties", "Parties", "STAplus Parties")
+        for p in graph.parties.values():
+            con.execute(
+                "INSERT OR REPLACE INTO parties VALUES (?,?,?,?,?)",
+                (
+                    self._cid("Party", p["@iot.id"]),
+                    self._c("Party", "description", p.get("description")),
+                    self._c("Party", "authId", p.get("authId")),
+                    self._c("Party", "role", p.get("role")),
+                    self._c("Party", "displayName", p.get("displayName")),
+                ),
+            )
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS licenses (
+                id {self._id_t("License")} PRIMARY KEY,
+                name {self._t("License", "name")},
+                description {self._t("License", "description")},
+                definition {self._t("License", "definition")},
+                logo {self._t("License", "logo")},
+                attribution_text {self._t("License", "attributionText")}
+            )
+        """)
+        self._reg_attrs("licenses", "Licenses", "STAplus Licenses")
+        for lic in graph.licenses.values():
+            con.execute(
+                "INSERT OR REPLACE INTO licenses VALUES (?,?,?,?,?,?)",
+                (
+                    self._cid("License", lic["@iot.id"]),
+                    self._c("License", "name", lic.get("name")),
+                    self._c("License", "description", lic.get("description")),
+                    self._c("License", "definition", lic.get("definition")),
+                    self._c("License", "logo", lic.get("logo")),
+                    self._c("License", "attributionText", lic.get("attributionText")),
+                ),
+            )
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id {self._id_t("Campaign")} PRIMARY KEY,
+                name {self._t("Campaign", "name")},
+                description {self._t("Campaign", "description")},
+                classification {self._t("Campaign", "classification")},
+                terms_of_use {self._t("Campaign", "termsOfUse")},
+                privacy_policy {self._t("Campaign", "privacyPolicy")},
+                url {self._t("Campaign", "url")},
+                creation_time {self._t("Campaign", "creationTime")},
+                start_time {self._t("Campaign", "startTime")},
+                end_time {self._t("Campaign", "endTime")},
+                properties {self._t("Campaign", "properties")},
+                party_id {self._id_t("Party")} REFERENCES parties(id),
+                license_id {self._id_t("License")} REFERENCES licenses(id)
+            )
+        """)
+        self._reg_attrs("campaigns", "Campaigns", "STAplus Campaigns")
+        for c in graph.campaigns.values():
+            con.execute(
+                "INSERT OR REPLACE INTO campaigns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    self._cid("Campaign", c["@iot.id"]),
+                    self._c("Campaign", "name", c.get("name")),
+                    self._c("Campaign", "description", c.get("description")),
+                    self._c("Campaign", "classification", c.get("classification")),
+                    self._c("Campaign", "termsOfUse", c.get("termsOfUse")),
+                    self._c("Campaign", "privacyPolicy", c.get("privacyPolicy")),
+                    self._c("Campaign", "url", c.get("url")),
+                    self._c("Campaign", "creationTime", c.get("creationTime")),
+                    self._c("Campaign", "startTime", c.get("startTime")),
+                    self._c("Campaign", "endTime", c.get("endTime")),
+                    self._c("Campaign", "properties", c.get("properties") or {}),
+                    self._cid("Party", c.get("_party_id")),
+                    self._cid("License", c.get("_license_id")),
+                ),
+            )
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS observation_groups (
+                id {self._id_t("ObservationGroup")} PRIMARY KEY,
+                name {self._t("ObservationGroup", "name")},
+                description {self._t("ObservationGroup", "description")},
+                purpose {self._t("ObservationGroup", "purpose")},
+                creation_time {self._t("ObservationGroup", "creationTime")},
+                end_time {self._t("ObservationGroup", "endTime")},
+                terms_of_use {self._t("ObservationGroup", "termsOfUse")},
+                privacy_policy {self._t("ObservationGroup", "privacyPolicy")},
+                data_quality {self._t("ObservationGroup", "dataQuality")},
+                properties {self._t("ObservationGroup", "properties")},
+                party_id {self._id_t("Party")} REFERENCES parties(id),
+                license_id {self._id_t("License")} REFERENCES licenses(id)
+            )
+        """)
+        self._reg_attrs(
+            "observation_groups", "ObservationGroups", "STAplus ObservationGroups",
+        )
+        for g in graph.observation_groups.values():
+            con.execute(
+                "INSERT OR REPLACE INTO observation_groups "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    self._cid("ObservationGroup", g["@iot.id"]),
+                    self._c("ObservationGroup", "name", g.get("name")),
+                    self._c("ObservationGroup", "description", g.get("description")),
+                    self._c("ObservationGroup", "purpose", g.get("purpose")),
+                    self._c("ObservationGroup", "creationTime", g.get("creationTime")),
+                    self._c("ObservationGroup", "endTime", g.get("endTime")),
+                    self._c("ObservationGroup", "termsOfUse", g.get("termsOfUse")),
+                    self._c(
+                        "ObservationGroup", "privacyPolicy", g.get("privacyPolicy"),
+                    ),
+                    self._c("ObservationGroup", "dataQuality", g.get("dataQuality")),
+                    self._c(
+                        "ObservationGroup", "properties", g.get("properties") or {},
+                    ),
+                    self._cid("Party", g.get("_party_id")),
+                    self._cid("License", g.get("_license_id")),
+                ),
+            )
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS relations (
+                id {self._id_t("Relation")} PRIMARY KEY,
+                role {self._t("Relation", "role")},
+                description {self._t("Relation", "description")},
+                external_resource {self._t("Relation", "externalResource")},
+                properties {self._t("Relation", "properties")},
+                subject_id {self._id_t("Observation")} REFERENCES observations(id),
+                object_id {self._id_t("Observation")} REFERENCES observations(id)
+            )
+        """)
+        self._reg_attrs("relations", "Relations", "STAplus Relations")
+        for r in graph.relations.values():
+            con.execute(
+                "INSERT OR REPLACE INTO relations VALUES (?,?,?,?,?,?,?)",
+                (
+                    self._cid("Relation", r["@iot.id"]),
+                    self._c("Relation", "role", r.get("role")),
+                    self._c("Relation", "description", r.get("description")),
+                    self._c(
+                        "Relation", "externalResource", r.get("externalResource"),
+                    ),
+                    self._c("Relation", "properties", r.get("properties") or {}),
+                    self._cid("Observation", r.get("_subject_id")),
+                    self._cid("Observation", r.get("_object_id")),
+                ),
+            )
+
+        party_t = self._id_t("Party")
+        lic_t = self._id_t("License")
+        for col_sql in (
+            f"ALTER TABLE datastreams ADD COLUMN party_id {party_t} "
+            f"REFERENCES parties(id)",
+            f"ALTER TABLE datastreams ADD COLUMN license_id {lic_t} "
+            f"REFERENCES licenses(id)",
+            f"ALTER TABLE things ADD COLUMN party_id {party_t} REFERENCES parties(id)",
+        ):
+            try:
+                con.execute(col_sql)
+            except Exception:
+                pass
+        if has_mds:
+            for col_sql in (
+                f"ALTER TABLE multi_datastreams ADD COLUMN party_id {party_t} "
+                f"REFERENCES parties(id)",
+                f"ALTER TABLE multi_datastreams ADD COLUMN license_id {lic_t} "
+                f"REFERENCES licenses(id)",
+            ):
+                try:
+                    con.execute(col_sql)
+                except Exception:
+                    pass
+
+        for ds_id, party_id in graph.datastream_party.items():
+            con.execute(
+                "UPDATE datastreams SET party_id=? WHERE id=?",
+                (self._cid("Party", party_id), self._cid("Datastream", ds_id)),
+            )
+        for ds_id, lic_id in graph.datastream_license.items():
+            con.execute(
+                "UPDATE datastreams SET license_id=? WHERE id=?",
+                (self._cid("License", lic_id), self._cid("Datastream", ds_id)),
+            )
+        for tid, party_id in graph.thing_party.items():
+            con.execute(
+                "UPDATE things SET party_id=? WHERE id=?",
+                (self._cid("Party", party_id), self._cid("Thing", tid)),
+            )
+        if has_mds:
+            for sid, party_id in graph.multi_datastream_party.items():
+                con.execute(
+                    "UPDATE multi_datastreams SET party_id=? WHERE id=?",
+                    (
+                        self._cid("Party", party_id),
+                        self._cid("MultiDatastream", sid),
+                    ),
+                )
+            for sid, lic_id in graph.multi_datastream_license.items():
+                con.execute(
+                    "UPDATE multi_datastreams SET license_id=? WHERE id=?",
+                    (
+                        self._cid("License", lic_id),
+                        self._cid("MultiDatastream", sid),
+                    ),
+                )
+
+        ds_t = self._id_t("Datastream")
+        camp_t = self._id_t("Campaign")
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS datastream_campaigns (
+                datastream_id {ds_t} REFERENCES datastreams(id),
+                campaign_id {camp_t} REFERENCES campaigns(id),
+                PRIMARY KEY (datastream_id, campaign_id)
+            )
+        """)
+        self._reg_attrs(
+            "datastream_campaigns", "DS-Campaign Links", "Datastream ↔ Campaign",
+        )
+        for ds_id, camp_id in graph.datastream_campaigns:
+            con.execute(
+                "INSERT OR REPLACE INTO datastream_campaigns VALUES (?,?)",
+                (self._cid("Datastream", ds_id), self._cid("Campaign", camp_id)),
+            )
+
+        if has_mds:
+            mds_t = self._id_t("MultiDatastream")
+            con.execute(f"""
+                CREATE TABLE IF NOT EXISTS multi_datastream_campaigns (
+                    multi_datastream_id {mds_t} REFERENCES multi_datastreams(id),
+                    campaign_id {camp_t} REFERENCES campaigns(id),
+                    PRIMARY KEY (multi_datastream_id, campaign_id)
+                )
+            """)
+            self._reg_attrs(
+                "multi_datastream_campaigns",
+                "MDS-Campaign Links",
+                "MultiDatastream ↔ Campaign",
+            )
+            for sid, camp_id in graph.multi_datastream_campaigns:
+                con.execute(
+                    "INSERT OR REPLACE INTO multi_datastream_campaigns VALUES (?,?)",
+                    (
+                        self._cid("MultiDatastream", sid),
+                        self._cid("Campaign", camp_id),
+                    ),
+                )
+
+        og_t = self._id_t("ObservationGroup")
+        obs_t = self._id_t("Observation")
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS observation_group_observations (
+                observation_group_id {og_t} REFERENCES observation_groups(id),
+                observation_id {obs_t} REFERENCES observations(id),
+                PRIMARY KEY (observation_group_id, observation_id)
+            )
+        """)
+        self._reg_attrs(
+            "observation_group_observations",
+            "OG-Obs Links",
+            "ObservationGroup ↔ Observation",
+        )
+        for gid, oid in graph.observation_group_observations:
+            con.execute(
+                "INSERT OR REPLACE INTO observation_group_observations VALUES (?,?)",
+                (self._cid("ObservationGroup", gid), self._cid("Observation", oid)),
+            )
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS observation_group_campaigns (
+                observation_group_id {og_t} REFERENCES observation_groups(id),
+                campaign_id {camp_t} REFERENCES campaigns(id),
+                PRIMARY KEY (observation_group_id, campaign_id)
+            )
+        """)
+        self._reg_attrs(
+            "observation_group_campaigns",
+            "OG-Campaign Links",
+            "ObservationGroup ↔ Campaign",
+        )
+        for gid, cid in graph.observation_group_campaigns:
+            con.execute(
+                "INSERT OR REPLACE INTO observation_group_campaigns VALUES (?,?)",
+                (self._cid("ObservationGroup", gid), self._cid("Campaign", cid)),
+            )
+
+        rel_t = self._id_t("Relation")
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS observation_group_relations (
+                observation_group_id {og_t} REFERENCES observation_groups(id),
+                relation_id {rel_t} REFERENCES relations(id),
+                PRIMARY KEY (observation_group_id, relation_id)
+            )
+        """)
+        self._reg_attrs(
+            "observation_group_relations",
+            "OG-Relation Links",
+            "ObservationGroup ↔ Relation",
+        )
+        for gid, rid in graph.observation_group_relations:
+            con.execute(
+                "INSERT OR REPLACE INTO observation_group_relations VALUES (?,?)",
+                (self._cid("ObservationGroup", gid), self._cid("Relation", rid)),
+            )
+
+    def _write_dggs(self, graph: ExtensibleEntityGraph, has_mds: bool) -> None:
+        con = self.con
+
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS cells (
+                id {self._id_t("Cell")} PRIMARY KEY,
+                zone_id {self._t("Cell", "zoneId")},
+                zone_level {self._t("Cell", "zoneLevel")},
+                system {self._t("Cell", "system")},
+                encoding_type {self._t("Cell", "encodingType")},
+                geom BLOB,
+                properties {self._t("Cell", "properties")},
+                parent_id {self._id_t("Cell")} REFERENCES cells(id)
+            )
+        """)
+        self._reg_feature("cells", "Cells", "STA-DGGS Cells (boundary)")
+        geojsons: list = []
+        ordered = sorted(
+            graph.cells.values(),
+            key=lambda c: (
+                0 if c.get("_parent_id") is None else 1,
+                str(c["@iot.id"]),
+            ),
+        )
+        for cell in ordered:
+            gj = _boundary_geojson(cell.get("boundary"))
+            geojsons.append(gj)
+            zone_id = cell.get("zoneId")
+            if zone_id is None:
+                zone_id = cell.get("@iot.id")
+            con.execute(
+                "INSERT OR REPLACE INTO cells VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    self._cid("Cell", cell["@iot.id"]),
+                    self._c("Cell", "zoneId", zone_id),
+                    self._c("Cell", "zoneLevel", cell.get("zoneLevel")),
+                    self._c("Cell", "system", cell.get("system")),
+                    self._c("Cell", "encodingType", cell.get("encodingType")),
+                    _encode_geom(gj),
+                    self._c("Cell", "properties", cell.get("properties") or {}),
+                    self._cid("Cell", cell.get("_parent_id")),
+                ),
+            )
+        self._sync_feature_bbox("cells", geojsons)
+
+        cell_t = self._id_t("Cell")
+        for col_sql in (
+            f"ALTER TABLE observations ADD COLUMN cell_id {cell_t} "
+            f"REFERENCES cells(id)",
+            f"ALTER TABLE datastreams ADD COLUMN cell_id {cell_t} "
+            f"REFERENCES cells(id)",
+        ):
+            try:
+                con.execute(col_sql)
+            except Exception:
+                pass
+        if has_mds:
+            try:
+                con.execute(
+                    f"ALTER TABLE multi_datastreams ADD COLUMN cell_id {cell_t} "
+                    f"REFERENCES cells(id)"
+                )
+            except Exception:
+                pass
+
+        for oid, cell_id in graph.observation_cell.items():
+            con.execute(
+                "UPDATE observations SET cell_id=? WHERE id=?",
+                (self._cid("Cell", cell_id), self._cid("Observation", oid)),
+            )
+        for ds_id, cell_id in graph.datastream_cell.items():
+            con.execute(
+                "UPDATE datastreams SET cell_id=? WHERE id=?",
+                (self._cid("Cell", cell_id), self._cid("Datastream", ds_id)),
+            )
+        if has_mds:
+            for sid, cell_id in graph.multi_datastream_cell.items():
+                con.execute(
+                    "UPDATE multi_datastreams SET cell_id=? WHERE id=?",
+                    (
+                        self._cid("Cell", cell_id),
+                        self._cid("MultiDatastream", sid),
+                    ),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1718,12 +2514,12 @@ def _apply_data_temporal_extent(
 # GeoPackage statistics & IPT describeProcessing
 # ---------------------------------------------------------------------------
 
-def collect_gpkg_stats(path: str) -> dict:
+def collect_gpkg_stats(path: str, extra_tables: tuple[str, ...] = ()) -> dict:
     """Row counts, export metadata, spatial extent, and phenomenon time range."""
     con = sqlite3.connect(path)
     try:
         table_counts: dict[str, int] = {}
-        for table in GPKG_USER_TABLES:
+        for table in (*GPKG_USER_TABLES, *extra_tables):
             try:
                 row = con.execute(f"SELECT COUNT(*) FROM [{table}]").fetchone()
                 table_counts[table] = int(row[0]) if row else 0
@@ -2113,9 +2909,15 @@ def _build_stac_lineage_links(
             "type":  "application/json",
             "title": "SensorThings observations (input data)",
         }
+        odata_bits: list[str] = []
         odata_filter = (inputs or {}).get("filter")
         if odata_filter:
-            derived["description"] = f"OData $filter: {odata_filter}"
+            odata_bits.append(f"$filter: {odata_filter}")
+        odata_orderby = (inputs or {}).get("orderby")
+        if odata_orderby:
+            odata_bits.append(f"$orderby: {odata_orderby}")
+        if odata_bits:
+            derived["description"] = "OData " + "; ".join(odata_bits)
         links.append(derived)
 
         service_root = _sta_service_root_url(source_url)
@@ -2252,10 +3054,12 @@ def build_stac_item(context: dict, processing: dict) -> dict:
     }
 
 
-def describe_processing() -> None:
+def describe_processing(*, staplus: bool = False, dggs: bool = False) -> None:
     """IPT describeProcessing: framework context on stdin → STAC Item on stdout."""
     try:
         context = read_json_stdin()
+        if not context.get("processId"):
+            context["processId"] = "sta_to_gpkg"
         processing = context.get("processing")
         if not isinstance(processing, dict) or not processing:
             processing = parse_processing_meta(context.get("stderr"))
@@ -2265,6 +3069,24 @@ def describe_processing() -> None:
                 "(no OGC_PROCESSING_META on execute stderr)",
             )
         stac_item = build_stac_item(context, processing)
+        props = stac_item.get("properties") or {}
+        title = props.get("title") or ""
+        if title.startswith("SensorThings observations"):
+            if staplus and dggs:
+                props["title"] = "STAplus+DGGS observations export (GeoPackage)"
+                label = "STAplus+DGGS"
+            elif staplus:
+                props["title"] = "STAplus observations export (GeoPackage)"
+                label = "STAplus"
+            elif dggs:
+                props["title"] = "STA-DGGS observations export (GeoPackage)"
+                label = "STA-DGGS"
+            else:
+                label = None
+            if label:
+                src = (processing.get("export_metadata") or {}).get("source_url")
+                if src:
+                    props["description"] = f"GeoPackage export from {label} API ({src})"
         _require_ipt_stac_bbox(stac_item.get("bbox"))
         json.dump(stac_item, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
@@ -2290,6 +3112,7 @@ def read_request() -> dict:
     Optional fields
     ---------------
       filter           : str   — OData $filter expression
+      orderby          : str   — OData $orderby expression
       top              : int   — page size per HTTP request (default 1000)
       max_observations : int   — fetch exactly this many when the server has enough
                                  (0 = no limit); paged $top on every request
@@ -2315,17 +3138,30 @@ def read_request() -> dict:
     return req
 
 
-def run_export(req: dict, output_path: str) -> dict:
+def run_export(
+    req: dict,
+    output_path: str,
+    *,
+    staplus: bool = False,
+    dggs: bool = False,
+) -> dict:
     """
     Fetch STA observations and write a GeoPackage to output_path.
     Returns processing metadata for describeProcessing / STAC.
+
+    ``staplus`` / ``dggs`` enable optional entity sets (CLI ``--staplus`` / ``--dggs``).
     """
-    obs_url    = req["url"]
-    sta_filter = req.get("filter")
-    page_size  = int(req.get("top",              1000))
-    max_obs    = int(req.get("max_observations", 0))
-    timeout    = int(req.get("timeout",          30))
-    verbose    = bool(req.get("verbose",         False))
+    profile = extension_profile(staplus, dggs)
+    banner = profile["banner"]
+    extra_user_tables = profile["extra_user_tables"]
+    require_entities = profile["require_entities"]
+    obs_url     = req["url"]
+    sta_filter  = req.get("filter")
+    sta_orderby = req.get("orderby")
+    page_size   = int(req.get("top",              1000))
+    max_obs     = int(req.get("max_observations", 0))
+    timeout     = int(req.get("timeout",          30))
+    verbose     = bool(req.get("verbose",         False))
 
     if max_obs < 0:
         execution_fail("max_observations must be >= 0")
@@ -2390,7 +3226,7 @@ def run_export(req: dict, output_path: str) -> dict:
 
     emit_progress(0)
 
-    log.info("=== SensorThings → GeoPackage ===")
+    log.info("=== %s ===", banner)
     log.info("Source           : %s", obs_url)
     log.info("Output path      : %s", output_path)
     log.info("max_observations : %s", max_obs if max_obs > 0 else "unlimited")
@@ -2403,14 +3239,28 @@ def run_export(req: dict, output_path: str) -> dict:
     probe_session = requests.Session()
     probe_session.headers["Accept"] = "application/json"
     caps = ServiceCapabilities(base_url, probe_session, timeout)
+    if require_entities:
+        missing = sorted(e for e in require_entities if e not in caps.entity_names)
+        if missing:
+            execution_fail(
+                "Service landing page is missing required entity set(s): "
+                + ", ".join(missing),
+            )
     emit_progress(5)
 
-    client = STAClient(obs_url, caps, page_size=page_size, timeout=timeout)
-    graph  = EntityGraph()
+    expand = build_expand(
+        caps.has_multi_datastream, staplus=staplus, dggs=dggs,
+    )
+    client = STAClient(
+        obs_url, caps, page_size=page_size, timeout=timeout, expand=expand,
+    )
+    graph = ExtensibleEntityGraph(staplus=staplus, dggs=dggs)
 
     extra: dict[str, str] = {}
     if sta_filter:
         extra["$filter"] = sta_filter
+    if sta_orderby:
+        extra["$orderby"] = sta_orderby
 
     log.info("Fetching observations…")
     t0 = time.time()
@@ -2437,14 +3287,16 @@ def run_export(req: dict, output_path: str) -> dict:
     emit_progress(85)
     log.info("Writing GeoPackage…")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    gpkg = GeoPackageWriter(output_path, caps.metadata)
+    gpkg = ExtensibleGeoPackageWriter(
+        output_path, caps.metadata, staplus=staplus, dggs=dggs,
+    )
     gpkg.write(graph, source_url=obs_url,
                request_count=client.request_count,
                has_mds=caps.has_multi_datastream)
     gpkg.close()
 
     gpkg_bytes = os.path.getsize(output_path)
-    gpkg_stats = collect_gpkg_stats(output_path)
+    gpkg_stats = collect_gpkg_stats(output_path, extra_tables=extra_user_tables)
     emit_progress(95)
     log.info("GeoPackage written — %d bytes", gpkg_bytes)
 
@@ -2466,14 +3318,36 @@ def run_export(req: dict, output_path: str) -> dict:
     }
 
 
-def main():
+def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
+    """CLI flags for optional STAplus / DGGS support (stdin still carries the JSON request)."""
+    parser = argparse.ArgumentParser(
+        prog="sta_to_gpkg",
+        description=(
+            "Export SensorThings Observations to GeoPackage. "
+            "JSON request on stdin; GeoPackage bytes on stdout."
+        ),
+    )
+    parser.add_argument(
+        "--staplus",
+        action="store_true",
+        help="Enable STAplus entities (Party, License, Campaign, ObservationGroup, Relation)",
+    )
+    parser.add_argument(
+        "--dggs",
+        action="store_true",
+        help="Enable STA-DGGS Cell entities (cells layer + cell_id foreign keys)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(*, staplus: bool = False, dggs: bool = False):
     """Execute: GeoPackage on stdout; OGC_PROCESSING_META on stderr; errors on stdout under OGC."""
     try:
         req = read_request()
         with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            processing = run_export(req, tmp_path)
+            processing = run_export(req, tmp_path, staplus=staplus, dggs=dggs)
             emit_processing_meta(processing)
             stdout_bin = sys.stdout.buffer if hasattr(sys.stdout, "buffer") else sys.stdout
             with open(tmp_path, "rb") as f:
@@ -2488,7 +3362,8 @@ def main():
 
 
 if __name__ == "__main__":
+    _cli = parse_cli()
     if os.environ.get("OGC_ACTION") == "describeProcessing":
-        describe_processing()
+        describe_processing(staplus=_cli.staplus, dggs=_cli.dggs)
     else:
-        main()
+        main(staplus=_cli.staplus, dggs=_cli.dggs)

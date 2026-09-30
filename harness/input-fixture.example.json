@@ -1,6 +1,7 @@
 {
   "url": "https://YOUR-SERVER/v1.1/Observations",
   "filter": "phenomenonTime ge 2024-01-01T00:00:00Z",
+  "orderby": "phenomenonTime desc",
   "top": 1000,
   "max_observations": 10000,
   "timeout": 300,
